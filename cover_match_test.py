@@ -1,53 +1,54 @@
 import cv2
 import requests
 import numpy as np
+from urllib.parse import quote
 
-orb = cv2.ORB_create(nfeatures=1000)
+orb = cv2.ORB_create(nfeatures=1500)
 
-# Put MusicBrainz release-group IDs here
-ALBUMS = [
-    {
-        "title": "Abbey Road",
-        "artist": "The Beatles",
-        "mbid": "bd55aeb7-19d1-4f01-8c46-77e8a6064f27"
-       
-    },
-    {
-        "title": "The Dark Side of the Moon",
-        "artist": "Pink Floyd",
-        "mbid": "f5093c06-23e3-404f-aeaa-40f72885ee3a"
-    }
-]
+HEADERS = {
+    "User-Agent": "AlbumCoverMatcher/1.0"
+}
 
 
-def image_from_url(url):
-    response = requests.get(url, timeout=10)
+def search_musicbrainz(artist, album, limit=5):
+    query = f'artist:"{artist}" AND releasegroup:"{album}"'
+    url = (
+        "https://musicbrainz.org/ws/2/release-group/"
+        f"?query={quote(query)}&limit={limit}&fmt=json"
+    )
+
+    response = requests.get(url, headers=HEADERS, timeout=10)
     response.raise_for_status()
 
-    arr = np.asarray(bytearray(response.content), dtype=np.uint8)
-    img = cv2.imdecode(arr, cv2.IMREAD_GRAYSCALE)
+    data = response.json()
+    results = []
 
-    return img
+    for rg in data.get("release-groups", []):
+        results.append({
+            "title": rg.get("title", "Unknown title"),
+            "artist": rg.get("artist-credit", [{}])[0].get("name", "Unknown artist"),
+            "mbid": rg.get("id")
+        })
+
+    return results
 
 
 def get_cover_from_archive(mbid):
-    url = f"https://coverartarchive.org/release-group/{mbid}"
-    response = requests.get(url, timeout=10)
+    return f"https://coverartarchive.org/release-group/{mbid}/front-500"
 
-    if response.status_code != 200:
+
+def image_from_url(url):
+    try:
+        response = requests.get(url, timeout=10, allow_redirects=True)
+
+        if response.status_code != 200:
+            return None
+
+        arr = np.asarray(bytearray(response.content), dtype=np.uint8)
+        return cv2.imdecode(arr, cv2.IMREAD_GRAYSCALE)
+
+    except requests.RequestException:
         return None
-
-    data = response.json()
-
-    if not data.get("images"):
-        return None
-
-    image = data["images"][0]
-
-    if "thumbnails" in image and "small" in image["thumbnails"]:
-        return image["thumbnails"]["small"]
-
-    return image["image"]
 
 
 def compare_images(query_img, db_img):
@@ -60,48 +61,57 @@ def compare_images(query_img, db_img):
     matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
     matches = matcher.match(des1, des2)
 
-    good_matches = [m for m in matches if m.distance < 50]
-
+    good_matches = [m for m in matches if m.distance < 55]
     return len(good_matches)
 
 
-def identify_album_from_cover(query_image_path):
+def identify_album_from_cover(query_image_path, artist, album):
     query_img = cv2.imread(query_image_path, cv2.IMREAD_GRAYSCALE)
 
     if query_img is None:
-        raise ValueError("Could not load query image.")
+        raise ValueError("Could not load query image. Check the file path.")
+
+    possible_albums = search_musicbrainz(artist, album)
+
+    if not possible_albums:
+        return None, 0
 
     best_album = None
     best_score = 0
 
-    for album in ALBUMS:
-        cover_url = get_cover_from_archive(album["mbid"])
-
-        if cover_url is None:
-            print(f"No cover found for {album['title']}")
-            continue
-
+    for item in possible_albums:
+        cover_url = get_cover_from_archive(item["mbid"])
         db_img = image_from_url(cover_url)
 
         if db_img is None:
+            print(f"No cover found for {item['title']}")
             continue
 
         score = compare_images(query_img, db_img)
-
-        print(f"{album['title']} score: {score}")
+        print(f"{item['title']} by {item['artist']} score: {score}")
 
         if score > best_score:
             best_score = score
-            best_album = album
+            best_album = item
 
-    if best_score < 15:
+    if best_score < 25:
         return None, best_score
 
     return best_album, best_score
 
 
-album, score = identify_album_from_cover("test_image.jpg")
+album, score = identify_album_from_cover(
+    "test_image.jpg",
+    artist="The Beatles",
+    album="Abbey Road"
+)
 
 print("\nBest match:")
-print(album)
+
+if album:
+    print(f"{album['title']} by {album['artist']}")
+    print("MBID:", album["mbid"])
+else:
+    print("No confident match found")
+
 print("Score:", score)
