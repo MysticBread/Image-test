@@ -1,142 +1,109 @@
 """
-Album Cover Identifier
-======================
-1. Send the image to Hugging Face (BLIP)  →  extract artist + album text
-2. Query MusicBrainz with those names     →  get candidate release groups
-3. Fetch cover art from Cover Art Archive →  ORB visual match to confirm
+Album Cover Identifier — CLIP + FAISS edition
+==============================================
+1. Encode the query image with CLIP           →  get a visual vector
+2. Search the FAISS index for nearest match   →  find closest cover
+3. Fetch that cover from Cover Art Archive    →  ORB visual confirmation
+
+No text needed — works on purely visual content including textless covers.
 
 Setup:
-    pip install opencv-python requests numpy Pillow
+    pip install transformers torch faiss-cpu opencv-python requests Pillow numpy
 
 Usage:
+    # First build the index (run once):
+    python build_index.py --limit 500
+    python build_index.py --artist "Coil" --append
+    python build_index.py --artist "The Beatles" --append
+
+    # Then identify any cover:
     python album_matcher.py test_image.png
-    python album_matcher.py test_image.png --hf-token hf_xxxxxxxx
-
-A free Hugging Face account + token is all that's needed:
-    https://huggingface.co/settings/tokens  (read token, no payment required)
-
-The token can also be set via the HF_TOKEN environment variable.
+    python album_matcher.py test_image.png --top 5
 """
 
 import argparse
+import io
 import os
-import time
-from urllib.parse import quote
+import json
 
 import cv2
+import faiss
 import numpy as np
 import requests
 from PIL import Image
+from transformers import CLIPModel, CLIPProcessor
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-ORB            = cv2.ORB_create(nfeatures=2000)
-TARGET_SIZE    = (300, 300)
-SCORE_THRESHOLD = 15
+CLIP_MODEL      = "openai/clip-vit-base-patch32"
+INDEX_FILE      = "covers.index"
+META_FILE       = "covers.json"
+ORB             = cv2.ORB_create(nfeatures=2000)
+TARGET_SIZE     = (300, 300)
+VECTOR_DIM      = 512
+# CLIP cosine similarity threshold (0-1). Lower = accept weaker matches.
+CLIP_THRESHOLD  = 0.70
+MB_HEADERS      = {"User-Agent": "AlbumCoverMatcher/1.0 (your@email.com)"}
 
-MB_HEADERS = {"User-Agent": "AlbumCoverMatcher/1.0 (your@email.com)"}
+# ── CLIP ──────────────────────────────────────────────────────────────────────
 
-# BLIP VQA model — runs locally via transformers, no API key needed
-# Downloads ~1GB on first run, cached after that
-BLIP_MODEL = "Salesforce/blip-vqa-base"
+_clip_processor = None
+_clip_model     = None
 
-
-# ── Step 1: Vision — BLIP running locally via transformers ───────────────────
-
-_blip_processor = None
-_blip_model = None
-
-def _load_blip():
-    """Load BLIP VQA model once and cache it. Downloads ~1GB on first run."""
-    global _blip_processor, _blip_model
-    if _blip_processor is None:
-        from transformers import BlipProcessor, BlipForQuestionAnswering
-        print("  Loading BLIP model (downloads ~1GB on first run)...")
-        _blip_processor = BlipProcessor.from_pretrained(BLIP_MODEL)
-        _blip_model = BlipForQuestionAnswering.from_pretrained(BLIP_MODEL)
-        _blip_model.eval()
-        print("  BLIP model ready.")
-    return _blip_processor, _blip_model
+def load_clip():
+    global _clip_processor, _clip_model
+    if _clip_processor is None:
+        print("Loading CLIP model (downloads ~600MB on first run)...")
+        _clip_processor = CLIPProcessor.from_pretrained(CLIP_MODEL)
+        _clip_model     = CLIPModel.from_pretrained(CLIP_MODEL)
+        _clip_model.eval()
+        print("CLIP ready.\n")
+    return _clip_processor, _clip_model
 
 
-def identify_with_huggingface(image_path: str, hf_token: str = None) -> dict:
-    """
-    Run BLIP VQA locally to extract artist and album title from the cover.
-    hf_token is unused but kept for API compatibility.
-    Returns {"artist": str, "album": str}.
-    """
+def encode_image(img: Image.Image) -> np.ndarray:
+    """Convert a PIL image to a normalised CLIP vector."""
     import torch
-    processor, model = _load_blip()
-    img = Image.open(image_path).convert("RGB")
+    processor, model = load_clip()
+    inputs = processor(images=img, return_tensors="pt")
+    with torch.no_grad():
+        features = model.get_image_features(**inputs)
+    vec = features.pooler_output.detach().numpy().astype("float32").reshape(1, -1)
+    vec /= np.linalg.norm(vec) + 1e-9   # L2 normalise → cosine via dot product
+    return vec
 
-    def ask(question: str) -> str:
-        inputs = processor(img, question, return_tensors="pt")
-        with torch.no_grad():
-            out = model.generate(**inputs)
-        answer = processor.decode(out[0], skip_special_tokens=True).strip()
-        return answer
+# ── FAISS search ──────────────────────────────────────────────────────────────
 
-    artist = ask("What is the name of the music artist or band on this album cover?")
-    album  = ask("What is the album title on this album cover?")
-
-    # Clean up common BLIP artefacts
-    for prefix in ("it is ", "the answer is ", "this is ", "i don't know", "unknown"):
-        if artist.lower().startswith(prefix):
-            artist = artist[len(prefix):].strip()
-        if album.lower().startswith(prefix):
-            album = album[len(prefix):].strip()
-
-    return {"artist": artist or "Unknown", "album": album or "Unknown"}
-
-
-# ── Step 2: MusicBrainz search ────────────────────────────────────────────────
-
-def search_musicbrainz(artist: str, album: str, limit: int = 5) -> list:
+def search_index(query_vec: np.ndarray, top_k: int = 5) -> list:
     """
-    Search MusicBrainz for release groups matching artist + album.
-    If the exact pair returns nothing, fall back to artist-only or album-only.
+    Search the FAISS index for the top_k nearest covers.
+    Returns list of {"title", "artist", "mbid", "score"} dicts.
     """
-    def _fetch(query: str) -> list:
-        url = (
-            "https://musicbrainz.org/ws/2/release-group/"
-            f"?query={quote(query)}&limit={limit}&fmt=json"
+    if not os.path.exists(INDEX_FILE):
+        raise FileNotFoundError(
+            f"Index file {INDEX_FILE!r} not found.\n"
+            "Run build_index.py first to create it."
         )
-        resp = requests.get(url, headers=MB_HEADERS, timeout=10)
-        resp.raise_for_status()
-        results = []
-        for rg in resp.json().get("release-groups", []):
-            credits = rg.get("artist-credit", [])
-            names   = [c["name"] for c in credits if isinstance(c, dict) and "name" in c]
-            results.append({
-                "title":  rg.get("title", "Unknown title"),
-                "artist": "".join(names) or "Unknown artist",
-                "mbid":   rg.get("id"),
-            })
-        return results
 
-    # Try exact combined query first
-    if artist != "Unknown" and album != "Unknown":
-        results = _fetch(f'artist:"{artist}" AND releasegroup:"{album}"')
-        if results:
-            return results
+    index = faiss.read_index(INDEX_FILE)
+    with open(META_FILE) as f:
+        meta = json.load(f)
 
-    # Fall back to album title only (handles cases where artist wasn't read clearly)
-    if album != "Unknown":
-        results = _fetch(f'releasegroup:"{album}"')
-        if results:
-            return results
+    scores, indices = index.search(query_vec, top_k)
 
-    # Last resort: artist only
-    if artist != "Unknown":
-        return _fetch(f'artist:"{artist}"')
+    results = []
+    for score, idx in zip(scores[0], indices[0]):
+        if idx < 0:   # FAISS returns -1 for empty slots
+            continue
+        item = meta[idx].copy()
+        item["clip_score"] = float(score)
+        results.append(item)
 
-    return []
+    return results
 
-
-# ── Step 3: Cover Art Archive ─────────────────────────────────────────────────
+# ── Cover Art Archive ─────────────────────────────────────────────────────────
 
 def get_cover_url(mbid: str) -> str | None:
-    """Return the front-cover image URL for a MusicBrainz release group."""
     try:
         resp = requests.get(
             f"https://coverartarchive.org/release-group/{mbid}",
@@ -171,57 +138,58 @@ def image_from_url(url: str):
     except requests.RequestException:
         return None
 
-
-# ── Step 4: ORB visual confirmation ──────────────────────────────────────────
+# ── ORB confirmation ──────────────────────────────────────────────────────────
 
 def preprocess(img):
     img = cv2.resize(img, TARGET_SIZE, interpolation=cv2.INTER_AREA)
     return cv2.equalizeHist(img)
 
 
-def compare_images(query_img, db_img) -> int:
+def orb_score(query_img, db_img) -> int:
     q, d = preprocess(query_img), preprocess(db_img)
     _, des1 = ORB.detectAndCompute(q, None)
     _, des2 = ORB.detectAndCompute(d, None)
-
     if des1 is None or des2 is None or len(des1) < 2 or len(des2) < 2:
         return 0
-
     raw  = cv2.BFMatcher(cv2.NORM_HAMMING).knnMatch(des1, des2, k=2)
     good = [m for m, n in raw if len((m, n)) == 2 and m.distance < 0.75 * n.distance]
     return len(good)
 
-
 # ── Main pipeline ─────────────────────────────────────────────────────────────
 
-def identify_album(image_path: str, hf_token: str) -> tuple:
-    # 1. Vision
-    print("→ Asking Hugging Face (BLIP) to read the cover...")
-    vision = identify_with_huggingface(image_path, hf_token)
-    print(f"  Detected: artist={vision['artist']!r}, album={vision['album']!r}")
+def identify_album(image_path: str, top_k: int = 5) -> dict | None:
+    # 1. Load and encode the query image with CLIP
+    print("→ Encoding query image with CLIP...")
+    query_pil = Image.open(image_path).convert("RGB")
+    query_vec = encode_image(query_pil)
 
-    if vision["artist"] == "Unknown" and vision["album"] == "Unknown":
-        print("  Could not extract any text from the cover.")
-        return None, 0, vision
+    # 2. Search the FAISS index
+    print("→ Searching index...")
+    candidates = search_index(query_vec, top_k=top_k)
 
-    # 2. MusicBrainz
-    print("\n→ Searching MusicBrainz...")
-    candidates = search_musicbrainz(vision["artist"], vision["album"])
     if not candidates:
-        print("  No results found on MusicBrainz.")
-        return None, 0, vision
+        print("  No candidates found in index.")
+        return None
 
-    # 3. ORB match
-    print("\n→ Fetching covers and matching visually...")
-    query_img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
-    if query_img is None:
-        raise ValueError(f"Could not load image: {image_path!r}")
+    print(f"  Top {len(candidates)} CLIP matches:")
+    for c in candidates:
+        print(f"    {c['clip_score']:.3f}  {c['title']} by {c['artist']}")
 
-    best_album, best_score = None, 0
+    # Filter by CLIP threshold — anything below is likely wrong
+    strong = [c for c in candidates if c["clip_score"] >= CLIP_THRESHOLD]
+    if not strong:
+        print(f"\n  No candidates above CLIP threshold ({CLIP_THRESHOLD}).")
+        print("  Closest match was:", candidates[0]["title"], "by", candidates[0]["artist"])
+        print("  → Add more covers to the index: python build_index.py --artist \"Artist Name\"")
+        return None
 
-    for item in candidates:
-        time.sleep(1.0)  # MusicBrainz rate limit
+    # 3. ORB confirmation on top CLIP candidates
+    print("\n→ Confirming with ORB feature matching...")
+    query_cv = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
 
+    best, best_orb = None, -1
+
+    for item in strong:
         cover_url = get_cover_url(item["mbid"])
         if not cover_url:
             print(f"  ✗ No cover art: {item['title']}")
@@ -232,47 +200,43 @@ def identify_album(image_path: str, hf_token: str) -> tuple:
             print(f"  ✗ Download failed: {item['title']}")
             continue
 
-        score = compare_images(query_img, db_img)
-        print(f"  • {item['title']} by {item['artist']}  →  score: {score}")
+        score = orb_score(query_cv, db_img)
+        print(f"  • {item['title']} by {item['artist']}  →  ORB: {score}  CLIP: {item['clip_score']:.3f}")
 
-        if score > best_score:
-            best_score = score
-            best_album = item
+        if score > best_orb:
+            best_orb = score
+            best = item
 
-    if best_score < SCORE_THRESHOLD:
-        # Vision ID was the best we could do — return it flagged as unconfirmed
-        print(f"\n  ORB score too low ({best_score}); returning vision result unconfirmed.")
-        return {
-            "title":     vision["album"],
-            "artist":    vision["artist"],
-            "mbid":      None,
-            "confirmed": False,
-        }, best_score, vision
+    # If ORB couldn't confirm, trust the top CLIP match
+    if best is None:
+        best = strong[0]
+        best["confirmed_by"] = "CLIP only"
+    else:
+        best["confirmed_by"] = "CLIP + ORB"
+        best["orb_score"]    = best_orb
 
-    best_album["confirmed"] = True
-    return best_album, best_score, vision
-
+    return best
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Identify an album cover using Hugging Face BLIP + MusicBrainz + ORB."
+        description="Identify an album cover using CLIP + FAISS + ORB."
     )
     parser.add_argument("image", help="Path to the album cover image (jpg, png, webp)")
+    parser.add_argument("--top",  type=int, default=5,
+                        help="Number of CLIP candidates to check with ORB (default 5)")
     args = parser.parse_args()
 
-    album, score, vision = identify_album(args.image, hf_token=None)
+    result = identify_album(args.image, top_k=args.top)
 
     print("\n── Result ──────────────────────────────────────────")
-    if album:
-        status = "✓ Confirmed" if album.get("confirmed") else "~ Unconfirmed (low visual score)"
-        print(f"  Status : {status}")
-        print(f"  Title  : {album['title']}")
-        print(f"  Artist : {album['artist']}")
-        if album.get("mbid"):
-            print(f"  MBID   : {album['mbid']}")
-        print(f"  Score  : {score}")
+    if result:
+        print(f"  Title      : {result['title']}")
+        print(f"  Artist     : {result['artist']}")
+        print(f"  MBID       : {result['mbid']}")
+        print(f"  CLIP score : {result['clip_score']:.3f}")
+        print(f"  Confirmed  : {result['confirmed_by']}")
     else:
         print("  Could not identify the album.")
-
+        print("  → Add more covers to the index: python build_index.py --artist \"Artist Name\"")

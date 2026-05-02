@@ -52,7 +52,7 @@ INDEX_FILE     = "covers.index"
 META_FILE      = "covers.json"
 PROGRESS_FILE  = "progress.json"
 VECTOR_DIM     = 512
-SAVE_EVERY     = 100          # save index to disk every N successful encodes
+SAVE_EVERY     = 10          # save index to disk every N successful encodes
 MB_BATCH       = 100          # MusicBrainz results per page (max 100)
 MB_HEADERS     = {"User-Agent": "AlbumCoverIndexer/1.0 (your@email.com)"}
 
@@ -78,7 +78,7 @@ def encode_image(img: Image.Image) -> np.ndarray:
     inputs = processor(images=img, return_tensors="pt")
     with torch.no_grad():
         features = model.get_image_features(**inputs)
-    vec = features[0].numpy().astype("float32")
+    vec = features.pooler_output.detach().numpy().astype("float32").reshape(1, -1)
     vec /= np.linalg.norm(vec) + 1e-9
     return vec
 
@@ -223,7 +223,7 @@ def crawl(query: str, index, meta, progress: dict):
                 print(f"  Encode error: {e}")
                 continue
 
-            index.add(np.expand_dims(vec, 0))
+            index.add(vec)
             meta.append({"title": item["title"], "artist": item["artist"], "mbid": mbid})
             existing_mbids.add(mbid)
             progress["indexed"] += 1
@@ -278,3 +278,4 @@ if __name__ == "__main__":
         save_index(index, meta)
         save_progress(progress)
         print(f"Saved. Resume by running the script again. ({index.ntotal} covers indexed so far)")
+
